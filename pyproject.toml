@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modbuscli"
+version = "0.1.0"
+description = "An interactive Modbus TCP client with background sessions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["console-menu>=0.8.0,<0.9", "pymodbus>=3.8,<4"]
+
+[project.scripts]
+modbuscli = "modbuscli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["modbuscli*"]
