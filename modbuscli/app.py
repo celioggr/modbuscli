@@ -1,9 +1,12 @@
 from collections.abc import Callable
 from math import isfinite
 import os
+import re
 import socket
 import sys
+import textwrap
 import time
+from enum import Enum
 from typing import Sequence
 
 from consolemenu import MenuFormatBuilder, SelectionMenu
@@ -16,8 +19,17 @@ from .operations import DataArea, read_values, validate_address_count, validate_
 from .sessions import OperationSession, SessionManager, run_once
 
 
+class NavigationAction(Enum):
+    BACK = "back"
+    BACK_TO_MAIN = "back_to_main"
+
+
+BACK_LABEL = "Back (or press B)"
+BACK_TO_MAIN_LABEL = "Back to Main Menu (or press M)"
+
+
 def main() -> None:
-    print("Modbus CLI - interactive Modbus TCP client")
+    _print_banner()
     host = "127.0.0.1"
     port = 502
     unit_id = 1
@@ -29,13 +41,16 @@ def main() -> None:
                 ("Client mode", "Configure connection"),
                 "Modbus CLI",
                 subtitle=_connection_subtitle(host, port, unit_id),
+                navigation=False,
             )
             if choice == -1:
                 break
             if choice == 0:
                 _client_menu(sessions, host, port, unit_id)
             elif choice == 1:
-                host, port, unit_id = _configure_connection(host, port, unit_id)
+                configured = _configure_connection(host, port, unit_id)
+                if isinstance(configured, tuple):
+                    host, port, unit_id = configured
     except (EOFError, KeyboardInterrupt):
         print("\nExiting.")
     finally:
@@ -44,6 +59,117 @@ def main() -> None:
 
 def _clear_screen() -> None:
     print("\033[2J\033[H", end="", flush=True)
+
+
+def _supports_color() -> bool:
+    return (
+        sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM", "").lower() != "dumb"
+    )
+
+
+def _paint(text: str, color: str, bold: bool = False) -> str:
+    if not _supports_color():
+        return text
+    style = f"\033[{1 if bold else 0};{color}m"
+    return f"{style}{text}\033[0m"
+
+
+def _print_banner() -> None:
+    banner = (
+        "  +-------------------------------------------------------------------------+\n"
+        "  |  MODBUS // MASTER                                                       |\n"
+        "  |  Industrial protocol control console                                   |\n"
+        "  +-------------------------------------------------------------------------+"
+    )
+    if _supports_color():
+        lines = banner.splitlines()
+        lines[0] = _paint(lines[0], "31", bold=True)
+        lines[1] = _paint(lines[1], "91", bold=True)
+        lines[2] = _paint(lines[2], "36")
+        lines[3] = _paint(lines[3], "31", bold=True)
+        banner = "\n".join(lines)
+    print(banner)
+
+
+def _print_dialog(title: str, message: str) -> None:
+    content_width = 72
+    wrapped_lines = [
+        line
+        for paragraph in message.splitlines()
+        for line in (textwrap.wrap(paragraph, width=content_width - 4) or [""])
+    ]
+    width = max(content_width, len(title) + 4, *(len(line) + 4 for line in wrapped_lines))
+    border = f"  +{'-' * width}+"
+    print(_paint(border, "31", bold=True))
+    print(
+        f"  |  {_paint(title, '91', bold=True)}"
+        f"{' ' * max(0, width - len(title) - 2)}|"
+    )
+    for line in wrapped_lines:
+        print(f"  |  {line:<{width - 2}}|")
+    print(_paint(border, "31", bold=True))
+
+
+def _boxed_input(title: str, prompt: str, allow_navigation: bool = True) -> str:
+    navigation_text = f"{BACK_LABEL}  |  {BACK_TO_MAIN_LABEL}"
+    content_width = max(
+        72,
+        len(title) + 4,
+        len(prompt) + 4,
+        len(navigation_text) + 4 if allow_navigation else 0,
+    )
+    border = f"  +{'-' * content_width}+"
+    print(_paint(border, "31", bold=True))
+    print(
+        f"  |  {_paint(title, '91', bold=True)}"
+        f"{' ' * max(0, content_width - len(title) - 2)}|"
+    )
+    if allow_navigation:
+        print(f"  |  {navigation_text:<{content_width - 2}}|")
+    prefix = f"  |  {prompt}: "
+    print(_paint(prefix, "96", bold=True), end="", flush=True)
+    value = input().strip()
+    print(f"  |{' ' * (content_width - 1)}|")
+    print(_paint(border, "31", bold=True))
+    return value
+
+
+def _style_menu_text(text: str, title: str | None = None) -> str:
+    if not _supports_color():
+        return text
+
+    styled_lines = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("+"):
+            styled_lines.append(_paint(line, "31", bold=True))
+        elif title and title in line:
+            styled_lines.append(_paint(line, "91", bold=True))
+        elif re.fullmatch(r"\s*\|\s*\d+\s+-\s+.*\|\s*", line):
+            match = re.search(r"\d+ - ", line)
+            assert match is not None
+            styled_lines.append(
+                f"{line[:match.start()]}{_paint(match.group(), '93', bold=True)}"
+                f"{_paint(line[match.end():], '96', bold=True)}"
+            )
+        elif "Target:" in line:
+            line = line.replace("Target:", _paint("Target:", "96", bold=True))
+            line = line.replace("Unit ID:", _paint("Unit ID:", "93", bold=True))
+            line = line.replace("Connected", _paint("Connected", "92", bold=True))
+            line = re.sub(r"Error:", lambda match: _paint(match.group(), "91", bold=True), line)
+            styled_lines.append(line)
+        elif "Latest error:" in line:
+            styled_lines.append(_paint(line, "91"))
+        elif "[running]" in line:
+            styled_lines.append(line.replace("[running]", _paint("[running]", "92", bold=True)))
+        elif "[paused]" in line:
+            styled_lines.append(line.replace("[paused]", _paint("[paused]", "93", bold=True)))
+        elif line.lstrip().startswith(">>"):
+            styled_lines.append(_paint(line, "91", bold=True))
+        else:
+            styled_lines.append(line)
+    return "\n".join(styled_lines)
 
 
 def _connection_subtitle(host: str, port: int, unit_id: int) -> str:
@@ -63,21 +189,43 @@ def _show_menu(
     exit_option_text: str = "Exit",
     show_exit_option: bool = True,
     refresh_interval: float | None = None,
+    navigation: bool = True,
 ) -> int:
-    screen = RefreshingScreen(refresh_interval) if refresh_interval else None
+    screen = (
+        RefreshingScreen(refresh_interval)
+        if refresh_interval
+        else KeypressScreen()
+    )
     menu = LiveSelectionMenu(
         list(options),
         title=title,
         subtitle=subtitle,
         screen=screen,
         prologue_text=prologue_text,
-        show_exit_option=show_exit_option,
+        show_exit_option=show_exit_option and not navigation,
         exit_option_text=exit_option_text,
         formatter=MenuFormatBuilder().set_border_style_type(
             MenuBorderStyleType.ASCII_BORDER
         ),
     )
-    if screen is not None:
+    if navigation:
+        menu.append_item(
+            FunctionItem(
+                BACK_LABEL,
+                lambda: None,
+                menu=menu,
+                should_exit=True,
+            )
+        )
+        menu.append_item(
+            FunctionItem(
+                BACK_TO_MAIN_LABEL,
+                lambda: None,
+                menu=menu,
+                should_exit=True,
+            )
+        )
+    if isinstance(screen, RefreshingScreen):
         marker = "__LIVE_STATUS_MARKER__"
         template = menu.formatter.format(
             title=menu.get_title(),
@@ -96,12 +244,52 @@ def _show_menu(
         )
     menu.show()
     selected = menu.selected_option
+    if navigation and selected == len(options):
+        return -1
+    if navigation and selected == len(options) + 1:
+        return -2
     if show_exit_option and selected == len(options):
         return -1
     return selected
 
 
-class RefreshingScreen(Screen):
+class KeypressScreen(Screen):
+    def input(self, prompt: str = "") -> str:
+        return self._read_key(prompt)
+
+    def _read_key(self, prompt: str = "", timeout: float | None = None) -> str:
+        if os.name == "nt":
+            import msvcrt
+
+            if timeout is None:
+                return msvcrt.getwch()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    return msvcrt.getwch()
+                time.sleep(0.05)
+            return ""
+        if not sys.stdin.isatty():
+            return super().input(prompt)
+
+        import select
+        import termios
+        import tty
+
+        descriptor = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(descriptor)
+        try:
+            tty.setcbreak(descriptor)
+            if timeout is not None:
+                readable, _, _ = select.select([sys.stdin], [], [], timeout)
+                if not readable:
+                    return ""
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(descriptor, termios.TCSADRAIN, old_settings)
+
+
+class RefreshingScreen(KeypressScreen):
     def __init__(self, refresh_interval: float) -> None:
         super().__init__()
         self.refresh_interval = refresh_interval
@@ -119,33 +307,20 @@ class RefreshingScreen(Screen):
             self._refresh_callback()
 
     def input(self, prompt: str = "") -> str:
-        if os.name == "nt":
-            import msvcrt
-
-            deadline = time.monotonic() + self.refresh_interval
-            while time.monotonic() < deadline:
-                if msvcrt.kbhit():
-                    return msvcrt.getwch()
-                time.sleep(0.05)
-            return ""
-        if not sys.stdin.isatty():
-            return super().input(prompt)
-
-        import select
-        import termios
-        import tty
-
-        descriptor = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(descriptor)
-        try:
-            tty.setcbreak(descriptor)
-            readable, _, _ = select.select([sys.stdin], [], [], self.refresh_interval)
-            return sys.stdin.read(1) if readable else ""
-        finally:
-            termios.tcsetattr(descriptor, termios.TCSADRAIN, old_settings)
+        return self._read_key(prompt, timeout=self.refresh_interval)
 
 
 class LiveSelectionMenu(SelectionMenu):
+    def draw(self):
+        rendered = self.formatter.format(
+            title=self.get_title(),
+            subtitle=self.get_subtitle(),
+            items=self.items,
+            prologue_text=self.get_prologue_text(),
+            epilogue_text=self.get_epilogue_text(),
+        )
+        self.screen.printf(_style_menu_text(rendered, self.get_title()))
+
     def _main_loop(self) -> None:
         self._set_up_colors()
         SelectionMenu.currently_active_menu = self
@@ -162,8 +337,15 @@ class LiveSelectionMenu(SelectionMenu):
             if user_input is None:
                 self.should_exit = True
                 continue
+            shortcut_label = {
+                "b": BACK_LABEL,
+                "m": BACK_TO_MAIN_LABEL,
+            }.get(user_input.casefold())
             for index, item in enumerate(self.items):
-                if item.menu_char == user_input:
+                if (
+                    item.menu_char
+                    and item.menu_char.casefold() == user_input.casefold()
+                ) or (shortcut_label is not None and item.get_text() == shortcut_label):
                     self.current_option = index
                     self.select()
                     break
@@ -198,19 +380,31 @@ def _render_prologue(menu: LiveSelectionMenu) -> None:
     rows_up = len(rendered) - screen._prologue_start_row
     sys.stdout.write(f"\x1b[s\x1b[{rows_up}A\r")
     for index, row in enumerate(rows):
-        sys.stdout.write(f"\x1b[2K{row}")
+        sys.stdout.write(f"\x1b[2K{_style_menu_text(row, menu.get_title())}")
         if index < len(rows) - 1:
             sys.stdout.write("\x1b[1B\r")
     sys.stdout.write("\x1b[u")
     sys.stdout.flush()
 
 
-def _configure_connection(host: str, port: int, unit_id: int) -> tuple[str, int, int]:
+def _configure_connection(
+    host: str, port: int, unit_id: int
+) -> tuple[str, int, int] | NavigationAction:
     _clear_screen()
-    print("\nConfigure connection (press Enter to keep the current value)")
-    new_host = input(f"Target hostname or IP address [{host}]: ").strip() or host
+    new_host = _boxed_input(
+        "Configure connection (press Enter to keep current values)",
+        f"Target hostname or IP address [{host}]",
+        allow_navigation=True,
+    ) or host
+    navigation = _parse_navigation_action(new_host)
+    if navigation is not None:
+        return navigation
     new_port = _prompt_int("TCP port", 1, 65535, default=port)
+    if isinstance(new_port, NavigationAction):
+        return new_port
     new_unit_id = _prompt_int("Unit ID", 0, 255, default=unit_id)
+    if isinstance(new_unit_id, NavigationAction):
+        return new_unit_id
     return new_host, new_port, new_unit_id
 
 
@@ -230,20 +424,27 @@ def _client_menu(sessions: SessionManager, host: str, port: int, unit_id: int) -
             ),
             "Client mode",
             subtitle=subtitle,
-            exit_option_text="Back to main menu",
         )
-        if choice == -1:
+        if choice in (-1, -2):
             return
         if choice == 0:
-            last_message = _read_once(host, port, unit_id)
+            result = _read_once(host, port, unit_id)
         elif choice == 1:
-            last_message = _write_once(host, port, unit_id)
+            result = _write_once(host, port, unit_id)
         elif choice == 2:
-            last_message = _start_periodic_read(sessions, host, port, unit_id)
+            result = _start_periodic_read(sessions, host, port, unit_id)
         elif choice == 3:
-            last_message = _start_periodic_write(sessions, host, port, unit_id)
+            result = _start_periodic_write(sessions, host, port, unit_id)
         elif choice == 4:
-            last_message = _manage_sessions(sessions)
+            result = _manage_sessions(sessions)
+        else:
+            continue
+        if result is NavigationAction.BACK_TO_MAIN:
+            return
+        if result is NavigationAction.BACK:
+            last_message = ""
+            continue
+        last_message = result
 
 
 def _fit_status_line(text: str, width: int = 68) -> str:
@@ -252,38 +453,50 @@ def _fit_status_line(text: str, width: int = 68) -> str:
     return text[: width - 3] + "..."
 
 
-def _read_once(host: str, port: int, unit_id: int) -> str:
-    area = _select_area(writable_only=False)
-    if area is None:
-        return "Read cancelled."
-    address, count = _prompt_read_range(area)
+def _read_once(host: str, port: int, unit_id: int) -> str | NavigationAction:
+    settings = _select_read_settings()
+    if isinstance(settings, NavigationAction):
+        return settings
+    area, address, count = settings
 
+    run_operation = True
     while True:
-        def operation(client: ModbusTcpClient) -> str:
-            values = read_values(client, area, address, count, unit_id)
-            return f"{area.value.title()} at address {address}: {values}"
+        if run_operation:
+            def operation(client: ModbusTcpClient) -> str:
+                values = read_values(client, area, address, count, unit_id)
+                return f"{area.value.title()} at address {address}: {values}"
 
-        result = _run_and_report(host, port, unit_id, operation)
+            result = _run_and_report(host, port, unit_id, operation)
+            run_operation = False
         choice = _show_menu(
-            ("Read again with the same settings", "Read with new settings"),
+            (
+                "Read again with the same settings",
+                "Read with new settings",
+            ),
             "Single read",
             subtitle=result,
-            exit_option_text="Back to Client mode",
         )
         if choice == -1:
             return result
+        if choice == -2:
+            return NavigationAction.BACK_TO_MAIN
+        if choice == 0:
+            run_operation = True
         if choice == 1:
-            area = _select_area(writable_only=False)
-            if area is None:
-                return "Read cancelled."
-            address, count = _prompt_read_range(area)
+            settings = _select_read_settings()
+            if settings is NavigationAction.BACK_TO_MAIN:
+                return NavigationAction.BACK_TO_MAIN
+            if settings is NavigationAction.BACK:
+                continue
+            area, address, count = settings
+            run_operation = True
 
 
-def _write_once(host: str, port: int, unit_id: int) -> str:
-    area = _select_area(writable_only=True)
-    if area is None:
-        return "Write cancelled."
-    address, values = _prompt_write_values(area)
+def _write_once(host: str, port: int, unit_id: int) -> str | NavigationAction:
+    settings = _select_write_settings()
+    if isinstance(settings, NavigationAction):
+        return settings
+    area, address, values = settings
 
     def perform_write() -> str:
         def operation(client: ModbusTcpClient) -> str:
@@ -294,14 +507,19 @@ def _write_once(host: str, port: int, unit_id: int) -> str:
 
     result = perform_write()
 
+    navigation = NavigationAction.BACK
+    new_settings_item: FunctionItem
+
     def write_with_new_settings() -> None:
-        nonlocal area, address, values, result
-        new_area = _select_area(writable_only=True)
-        if new_area is None:
-            result = "Write cancelled; previous settings retained."
+        nonlocal area, address, values, result, navigation
+        settings = _select_write_settings()
+        if settings is NavigationAction.BACK_TO_MAIN:
+            navigation = NavigationAction.BACK_TO_MAIN
+            new_settings_item.should_exit = True
             return
-        area = new_area
-        address, values = _prompt_write_values(area)
+        if settings is NavigationAction.BACK:
+            return
+        area, address, values = settings
         result = perform_write()
 
     def update_result() -> None:
@@ -313,11 +531,11 @@ def _write_once(host: str, port: int, unit_id: int) -> str:
         title="Single write",
         subtitle=lambda: result,
         prologue_text=lambda: f"Current settings: {area.menu_label}, address {address}, values {values}",
+        show_exit_option=False,
         formatter=MenuFormatBuilder().set_border_style_type(
             MenuBorderStyleType.ASCII_BORDER
         ),
     )
-    menu.exit_item.text = "Back to Client mode"
     menu.append_item(
         FunctionItem(
             "Write again with the same settings",
@@ -326,58 +544,93 @@ def _write_once(host: str, port: int, unit_id: int) -> str:
             should_exit=False,
         )
     )
+    new_settings_item = FunctionItem(
+        "Write with new settings",
+        write_with_new_settings,
+        menu=menu,
+        should_exit=False,
+    )
+    menu.append_item(new_settings_item)
     menu.append_item(
         FunctionItem(
-            "Write with new settings",
-            write_with_new_settings,
+            BACK_LABEL,
+            lambda: None,
             menu=menu,
-            should_exit=False,
+            should_exit=True,
+        )
+    )
+    menu.append_item(
+        FunctionItem(
+            BACK_TO_MAIN_LABEL,
+            lambda: None,
+            menu=menu,
+            should_exit=True,
         )
     )
     menu.show()
+    if navigation is NavigationAction.BACK_TO_MAIN:
+        return NavigationAction.BACK_TO_MAIN
+    if menu.selected_option == len(menu.items) - 1:
+        return NavigationAction.BACK_TO_MAIN
+    if menu.selected_option == len(menu.items) - 2:
+        return result
     return result
 
 
-def _start_periodic_read(sessions: SessionManager, host: str, port: int, unit_id: int) -> str:
-    area = _select_area(writable_only=False)
-    if area is None:
-        return "Periodic read cancelled."
-    address, count = _prompt_read_range(area)
-    interval = _prompt_interval()
+def _start_periodic_read(
+    sessions: SessionManager, host: str, port: int, unit_id: int
+) -> str | NavigationAction:
+    while True:
+        settings = _select_read_settings()
+        if isinstance(settings, NavigationAction):
+            return settings
+        area, address, count = settings
+        interval = _prompt_interval()
+        if interval is NavigationAction.BACK:
+            continue
+        if interval is NavigationAction.BACK_TO_MAIN:
+            return interval
+        break
     session = sessions.start_read(host, port, unit_id, area, address, count, interval)
-    _control_periodic_read(sessions, session)
+    navigation = _control_periodic_read(sessions, session)
+    if navigation is NavigationAction.BACK_TO_MAIN:
+        return NavigationAction.BACK_TO_MAIN
     return (
         f"Periodic read session {session.session_id} ended after "
         f"{session.cycles} cycle(s). Latest values: {session.last_result}"
     )
 
 
-def _control_periodic_read(sessions: SessionManager, session: OperationSession) -> None:
+def _control_periodic_read(
+    sessions: SessionManager, session: OperationSession
+) -> NavigationAction:
     while True:
         if session.state in ("running", "paused"):
             toggle_label = "Pause reading" if session.state == "running" else "Resume reading"
-            options = (toggle_label, "Cancel read and return to Client mode")
+            options = (toggle_label,)
         else:
-            options = ("Return to Client mode",)
+            options = ()
         choice = _show_menu(
             options,
             "Periodic read",
             subtitle=f"{session.description}; every {session.interval:g}s; {session.state}",
             prologue_text=lambda: _single_read_status(session),
-            show_exit_option=False,
             refresh_interval=1 if session.state == "running" else None,
         )
         if session.state not in ("running", "paused"):
             sessions.stop(session.session_id)
-            return
+            return NavigationAction.BACK_TO_MAIN if choice == -2 else NavigationAction.BACK
         if choice == 0:
             if session.state == "running":
                 sessions.pause(session.session_id)
             else:
                 sessions.resume(session.session_id)
-        elif choice == 1 or choice == -1:
+        elif choice == -2:
             sessions.stop(session.session_id)
-            return
+            return NavigationAction.BACK_TO_MAIN
+        elif choice == -1:
+            sessions.stop(session.session_id)
+            return NavigationAction.BACK
 
 
 def _single_read_status(session: OperationSession) -> str:
@@ -391,12 +644,18 @@ def _single_read_status(session: OperationSession) -> str:
 
 def _start_periodic_write(
     sessions: SessionManager, host: str, port: int, unit_id: int
-) -> str:
-    area = _select_area(writable_only=True)
-    if area is None:
-        return "Periodic write cancelled."
-    address, values = _prompt_write_values(area)
-    interval = _prompt_interval()
+) -> str | NavigationAction:
+    while True:
+        settings = _select_write_settings()
+        if isinstance(settings, NavigationAction):
+            return settings
+        area, address, values = settings
+        interval = _prompt_interval()
+        if interval is NavigationAction.BACK:
+            continue
+        if interval is NavigationAction.BACK_TO_MAIN:
+            return interval
+        break
     session = sessions.start_write(host, port, unit_id, area, address, values, interval)
     return (
         f"Started background write session {session.session_id}: "
@@ -404,7 +663,7 @@ def _start_periodic_write(
     )
 
 
-def _manage_sessions(sessions: SessionManager) -> str:
+def _manage_sessions(sessions: SessionManager) -> str | NavigationAction:
     last_message = ""
     while True:
         active_sessions = [
@@ -433,26 +692,39 @@ def _manage_sessions(sessions: SessionManager) -> str:
             "Background sessions",
             subtitle=f"{len(active_sessions)} active session(s)",
             prologue_text="\n".join(details),
-            exit_option_text="Return to client menu",
         )
         if choice == -1:
             return last_message
+        if choice == -2:
+            return NavigationAction.BACK_TO_MAIN
         if choice == 0:
             continue
         if choice == 1:
             session_id = _prompt_int("Background write session ID", 1, 2**31 - 1)
+            if isinstance(session_id, NavigationAction):
+                if session_id is NavigationAction.BACK_TO_MAIN:
+                    return session_id
+                continue
             if sessions.pause(session_id):
                 last_message = f"Paused background write session {session_id}."
             else:
                 last_message = f"Could not pause running session {session_id}."
         elif choice == 2:
             session_id = _prompt_int("Background write session ID", 1, 2**31 - 1)
+            if isinstance(session_id, NavigationAction):
+                if session_id is NavigationAction.BACK_TO_MAIN:
+                    return session_id
+                continue
             if sessions.resume(session_id):
                 last_message = f"Resumed background write session {session_id}."
             else:
                 last_message = f"Could not resume paused session {session_id}."
         elif choice == 3:
             session_id = _prompt_int("Session ID", 1, 2**31 - 1)
+            if isinstance(session_id, NavigationAction):
+                if session_id is NavigationAction.BACK_TO_MAIN:
+                    return session_id
+                continue
             if sessions.stop(session_id):
                 last_message = f"Stopped session {session_id}."
             else:
@@ -462,7 +734,41 @@ def _manage_sessions(sessions: SessionManager) -> str:
             last_message = "All sessions stopped."
 
 
-def _select_area(writable_only: bool) -> DataArea | None:
+def _select_read_settings(
+) -> tuple[DataArea, int, int] | NavigationAction:
+    while True:
+        area = _select_area(writable_only=False)
+        if area is NavigationAction.BACK_TO_MAIN:
+            return NavigationAction.BACK_TO_MAIN
+        if area is None:
+            return NavigationAction.BACK
+        read_range = _prompt_read_range(area)
+        if read_range is NavigationAction.BACK:
+            continue
+        if read_range is NavigationAction.BACK_TO_MAIN:
+            return NavigationAction.BACK_TO_MAIN
+        address, count = read_range
+        return area, address, count
+
+
+def _select_write_settings(
+) -> tuple[DataArea, int, list[int]] | NavigationAction:
+    while True:
+        area = _select_area(writable_only=True)
+        if area is NavigationAction.BACK_TO_MAIN:
+            return NavigationAction.BACK_TO_MAIN
+        if area is None:
+            return NavigationAction.BACK
+        write_input = _prompt_write_values(area)
+        if write_input is NavigationAction.BACK:
+            continue
+        if write_input is NavigationAction.BACK_TO_MAIN:
+            return NavigationAction.BACK_TO_MAIN
+        address, values = write_input
+        return area, address, values
+
+
+def _select_area(writable_only: bool) -> DataArea | NavigationAction | None:
     areas = (
         (DataArea.COILS, DataArea.HOLDING_REGISTERS)
         if writable_only
@@ -471,62 +777,100 @@ def _select_area(writable_only: bool) -> DataArea | None:
     selected = _show_menu(
         tuple(area.menu_label for area in areas),
         "Select data area",
-        exit_option_text="Cancel",
     )
     if selected == -1:
         return None
+    if selected == -2:
+        return NavigationAction.BACK_TO_MAIN
     return areas[selected]
 
 
-def _prompt_read_range(area: DataArea) -> tuple[int, int]:
+def _prompt_read_range(area: DataArea) -> tuple[int, int] | NavigationAction:
     while True:
-        address = _prompt_int("Starting address", 0, 65535)
-        count = _prompt_int("Number of values", 1, 65536)
+        address = _prompt_int("Starting address", 0, 65535, allow_navigation=True)
+        if isinstance(address, NavigationAction):
+            return address
+        count = _prompt_int(
+            "Number of values to read", 1, 65536
+        )
+        if isinstance(count, NavigationAction):
+            if count is NavigationAction.BACK:
+                continue
+            return count
         try:
             validate_address_count(area, address, count)
             return address, count
         except ValueError as error:
-            print(error)
+            _print_dialog("Invalid read range", str(error))
 
 
-def _prompt_write_values(area: DataArea) -> tuple[int, list[int]]:
+def _prompt_write_values(
+    area: DataArea,
+) -> tuple[int, list[int]] | NavigationAction:
     value_prompt = (
-        "Coil value(s), comma-separated (for example 1,0,1): "
+        "Coil value(s), comma-separated (for example 1,0,1)"
         if area == DataArea.COILS
-        else "Register value(s), comma-separated (for example 123,456): "
+        else "Register value(s), comma-separated (for example 123,456)"
     )
+    title = f"Write {area.menu_label}"
     while True:
         address = _prompt_int("Starting address", 0, 65535)
-        raw_values = input(value_prompt).strip()
+        if isinstance(address, NavigationAction):
+            return address
+        raw_values = _boxed_input(title, value_prompt, allow_navigation=True)
+        navigation = _parse_navigation_action(raw_values)
+        if navigation is not None:
+            if navigation is NavigationAction.BACK:
+                continue
+            return navigation
         try:
             values = [int(value.strip()) for value in raw_values.split(",")]
             validate_write_values(area, address, values)
             return address, values
         except ValueError as error:
-            print(error)
+            _print_dialog("Invalid write values", str(error))
 
 
-def _prompt_interval() -> float:
+def _prompt_interval() -> float | NavigationAction:
     while True:
-        raw_value = input("Interval in seconds (minimum 0.1): ").strip()
+        raw_value = _boxed_input(
+            "Periodic interval",
+            "Interval in seconds (minimum 0.1)",
+            allow_navigation=True,
+        )
+        navigation = _parse_navigation_action(raw_value)
+        if navigation is not None:
+            return navigation
         try:
             interval = float(raw_value)
             if interval < 0.1 or not isfinite(interval):
                 raise ValueError
             return interval
         except ValueError:
-            print("Enter a finite interval of at least 0.1 seconds.")
+            _print_dialog(
+                "Invalid interval", "Enter a finite interval of at least 0.1 seconds."
+            )
 
 
 def _prompt_int(
-    label: str, minimum: int, maximum: int, default: int | None = None
-) -> int:
+    label: str,
+    minimum: int,
+    maximum: int,
+    default: int | None = None,
+    allow_navigation: bool = True,
+) -> int | NavigationAction:
     while True:
         try:
             prompt = f"{label} ({minimum}-{maximum})"
             if default is not None:
                 prompt += f" [{default}]"
-            raw_value = input(f"{prompt}: ").strip()
+            raw_value = _boxed_input(
+                "Enter a value", prompt, allow_navigation=allow_navigation
+            )
+            if allow_navigation:
+                navigation = _parse_navigation_action(raw_value)
+                if navigation is not None:
+                    return navigation
             if not raw_value and default is not None:
                 return default
             value = int(raw_value)
@@ -534,7 +878,18 @@ def _prompt_int(
                 return value
         except ValueError:
             pass
-        print(f"Enter an integer between {minimum} and {maximum}.")
+        _print_dialog(
+            "Invalid value", f"Enter an integer between {minimum} and {maximum}."
+        )
+
+
+def _parse_navigation_action(value: str) -> NavigationAction | None:
+    normalized = value.casefold()
+    if normalized in ("b", "back"):
+        return NavigationAction.BACK
+    if normalized in ("m", "main", "back to main menu"):
+        return NavigationAction.BACK_TO_MAIN
+    return None
 
 
 def _run_and_report(
