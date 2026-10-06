@@ -1,73 +1,35 @@
 # Modbus CLI
 
 An interactive Modbus TCP client for reading and writing coils and registers.
-Periodic reads run in a focused screen, while periodic writes can run as
-background sessions.
 
-## Requirements
+## Dependencies
 
 - Python 3.10 or later
-- A reachable Modbus TCP endpoint
+- `console-menu` 0.8.x
+- `pymodbus` 3.x
 
-## Install and run
+Dependencies are installed automatically with the package.
+
+## Run
+
+From the project directory:
 
 ```powershell
-py -m pip install -e .
+py -m pip install .
 modbuscli
 ```
 
-Or run from the project directory without installing the command:
+Or run directly from the source tree:
 
 ```powershell
 py -m modbuscli
 ```
 
-The default target is `127.0.0.1:502` with unit ID `1`. Use **Configure
-connection** from the main menu to change the target, port, or unit ID. Return
-to the main menu to change the connection. The terminal is cleared when
-entering client mode. Menus use a bordered selection interface: press the
-number shown beside an option to select it immediately, without pressing
-Enter. Menus show **Back (or press B)** followed by
-**Back to Main Menu (or press M)**; text-entry dialogs accept the same B/M
-shortcuts. The main menu provides Exit. The main and client menus show a TCP
-connection check for the configured host and port; the check is repeated
-whenever a menu is displayed.
-The probe briefly opens and closes a TCP connection, so it indicates current
-reachability rather than a persistent connection. The client supports Modbus
-TCP. Interactive terminals use a red, cyan, and green ANSI color theme; set
-`NO_COLOR` to disable colors. Text-entry prompts and validation messages are
-also presented in ASCII-bordered dialogs.
+The default connection is `127.0.0.1:502`, Unit ID `1`. Change it in the
+Configure connection menu.
 
-## Operations
-
-- Data-area selections use the standard Modbus reference prefixes: coils (0x),
-  discrete inputs (1x), input registers (3x), and holding registers (4x).
-- Single reads and writes open a dedicated result screen with options to repeat
-  using the same settings, run again with new settings, go **Back** to Client
-  mode, or go **Back to Main Menu**. For writes, changing settings keeps the
-  Single write screen open while you choose an area and enter the new address
-  and values.
-- Read coils, discrete inputs, holding registers, or input registers once.
-- Write one or more coils or holding registers once or periodically. For
-  multiple consecutive values, enter comma-separated values (for example,
-  `1,0,1` for coils or `123,456` for holding registers).
-- Periodic reads run in a dedicated screen with live values and Pause/Resume
-  controls, plus the standard Back and Back to Main Menu navigation.
-- Periodic writes run in the background, so you can read from the device while
-  a write session continues. Background writes can be paused, resumed, or
-  stopped from the session manager.
-- List active background sessions to inspect their state, cycle count, latest
-  result, or latest error; stopped and failed sessions are not shown. Stop one
-  session or all sessions from the session manager. Session IDs are reused
-  once a session stops or fails, so IDs stay compact among active sessions.
-
-Addresses use the zero-based offsets expected by pymodbus. Coil values must be
-`0` or `1`; register values must be between `0` and `65535`. Periodic intervals
-must be at least 0.1 seconds. Sessions run only while the application remains
-open, and all running sessions are stopped when you exit.
-
-## Tests
+## Compile
 
 ```powershell
-py -m unittest discover -s tests -v
+py -m compileall -q modbuscli
 ```

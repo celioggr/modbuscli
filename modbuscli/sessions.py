@@ -27,6 +27,7 @@ class OperationSession:
     state: str = "running"
     cycles: int = 0
     last_result: str = "Waiting for first operation."
+    last_values: list[int] | None = None
     last_error: str | None = None
     updated_at: datetime = field(default_factory=datetime.now)
     stop_event: Event = field(default_factory=Event, repr=False)
@@ -162,18 +163,19 @@ class SessionManager:
                             raise ConnectionError(
                                 f"Could not connect to {session.host}:{session.port}."
                             )
+                        read_result: list[int] | None = None
                         if session.values is None:
                             assert session.count is not None
-                            values = read_values(
+                            read_result = read_values(
                                 client, session.area, session.address, session.count, session.unit_id
                             )
-                            result = f"Read {values}"
+                            result = f"Read {read_result}"
                         else:
                             write_values(
                                 client, session.area, session.address, session.values, session.unit_id
                             )
                             result = f"Wrote {session.values}"
-                        self._update(session, result=result)
+                        self._update(session, result=result, values=read_result)
                     except Exception as error:
                         client.close()
                         self._update(session, error=str(error))
@@ -188,13 +190,20 @@ class SessionManager:
         self._update(session, state="stopped")
 
     def _update(
-        self, session: OperationSession, result: str | None = None, error: str | None = None, state: str | None = None
+        self,
+        session: OperationSession,
+        result: str | None = None,
+        error: str | None = None,
+        state: str | None = None,
+        values: list[int] | None = None,
     ) -> None:
         with self._lock:
             session.cycles += 1 if result is not None or error is not None else 0
             if result is not None:
                 session.last_result = result
                 session.last_error = None
+            if values is not None:
+                session.last_values = values.copy()
             if error is not None:
                 session.last_error = error
             if state is not None:

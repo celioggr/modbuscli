@@ -2,6 +2,7 @@ from collections.abc import Callable
 from math import isfinite
 import os
 import re
+import shutil
 import socket
 import sys
 import textwrap
@@ -16,6 +17,7 @@ from consolemenu.screen import Screen
 from pymodbus.client import ModbusTcpClient
 
 from .operations import DataArea, read_values, validate_address_count, validate_write_values, write_values
+from .presentation import format_read_table
 from .sessions import OperationSession, SessionManager, run_once
 
 
@@ -225,23 +227,6 @@ def _show_menu(
                 should_exit=True,
             )
         )
-    if isinstance(screen, RefreshingScreen):
-        marker = "__LIVE_STATUS_MARKER__"
-        template = menu.formatter.format(
-            title=menu.get_title(),
-            subtitle=menu.get_subtitle(),
-            prologue_text=marker,
-            items=menu.items,
-        )
-        screen.configure_refresh(
-            lambda: _render_prologue(menu),
-            next(
-                index
-                for index, line in enumerate(template.splitlines())
-                if marker in line
-            )
-            + 1,
-        )
     menu.show()
     selected = menu.selected_option
     if navigation and selected == len(options):
@@ -293,18 +278,7 @@ class RefreshingScreen(KeypressScreen):
     def __init__(self, refresh_interval: float) -> None:
         super().__init__()
         self.refresh_interval = refresh_interval
-        self._refresh_callback: Callable[[], None] | None = None
-        self._prologue_start_row = 0
-
-    def configure_refresh(
-        self, callback: Callable[[], None], prologue_start_row: int
-    ) -> None:
-        self._refresh_callback = callback
-        self._prologue_start_row = prologue_start_row
-
-    def refresh_prologue(self) -> None:
-        if self._refresh_callback is not None:
-            self._refresh_callback()
+        self.rendered_lines: list[str] | None = None
 
     def input(self, prompt: str = "") -> str:
         return self._read_key(prompt, timeout=self.refresh_interval)
@@ -319,7 +293,45 @@ class LiveSelectionMenu(SelectionMenu):
             prologue_text=self.get_prologue_text(),
             epilogue_text=self.get_epilogue_text(),
         )
+        if isinstance(self.screen, RefreshingScreen):
+            self.screen.rendered_lines = rendered.splitlines()
         self.screen.printf(_style_menu_text(rendered, self.get_title()))
+
+    def refresh_dynamic_content(self) -> None:
+        if not isinstance(self.screen, RefreshingScreen):
+            return
+        rendered = self.formatter.format(
+            title=self.get_title(),
+            subtitle=self.get_subtitle(),
+            items=self.items,
+            prologue_text=self.get_prologue_text(),
+            epilogue_text=self.get_epilogue_text(),
+        )
+        new_lines = rendered.splitlines()
+        old_lines = self.screen.rendered_lines
+        if old_lines is None or len(old_lines) != len(new_lines):
+            self.clear_screen()
+            self.draw()
+            return
+
+        visible_rows = shutil.get_terminal_size(fallback=(80, 24)).lines
+        last_index = len(new_lines) - 1
+        updates = [
+            (last_index - index, line)
+            for index, (old, line) in enumerate(zip(old_lines, new_lines))
+            if old != line and last_index - index < visible_rows
+        ]
+        if updates:
+            sys.stdout.write("\033[s")
+            for rows_up, line in updates:
+                cursor_up = f"\033[{rows_up}A" if rows_up else ""
+                sys.stdout.write(
+                    f"\033[u{cursor_up}\r\033[2K"
+                    f"{_style_menu_text(line, self.get_title())}"
+                )
+            sys.stdout.write("\033[u")
+            sys.stdout.flush()
+        self.screen.rendered_lines = new_lines
 
     def _main_loop(self) -> None:
         self._set_up_colors()
@@ -332,7 +344,7 @@ class LiveSelectionMenu(SelectionMenu):
             user_input = self.get_input()
             if user_input == "":
                 if isinstance(self.screen, RefreshingScreen):
-                    self.screen.refresh_prologue()
+                    self.refresh_dynamic_content()
                 continue
             if user_input is None:
                 self.should_exit = True
@@ -359,32 +371,6 @@ class LiveSelectionMenu(SelectionMenu):
                     self.select()
                     if not self.should_exit:
                         self.draw()
-
-
-def _render_prologue(menu: LiveSelectionMenu) -> None:
-    status = menu.get_prologue_text()
-    if not isinstance(status, str):
-        return
-    rendered = menu.formatter.format(
-        title=menu.get_title(),
-        subtitle=menu.get_subtitle(),
-        prologue_text=status,
-        items=menu.items,
-    ).splitlines()
-    screen = menu.screen
-    if not isinstance(screen, RefreshingScreen):
-        return
-    status_lines = status.splitlines()
-    rows = rendered[screen._prologue_start_row - 1 :]
-    rows = rows[: len(status_lines)]
-    rows_up = len(rendered) - screen._prologue_start_row
-    sys.stdout.write(f"\x1b[s\x1b[{rows_up}A\r")
-    for index, row in enumerate(rows):
-        sys.stdout.write(f"\x1b[2K{_style_menu_text(row, menu.get_title())}")
-        if index < len(rows) - 1:
-            sys.stdout.write("\x1b[1B\r")
-    sys.stdout.write("\x1b[u")
-    sys.stdout.flush()
 
 
 def _configure_connection(
@@ -444,13 +430,10 @@ def _client_menu(sessions: SessionManager, host: str, port: int, unit_id: int) -
         if result is NavigationAction.BACK:
             last_message = ""
             continue
+        if choice in (0, 2):
+            last_message = ""
+            continue
         last_message = result
-
-
-def _fit_status_line(text: str, width: int = 68) -> str:
-    if len(text) <= width:
-        return text
-    return text[: width - 3] + "..."
 
 
 def _read_once(host: str, port: int, unit_id: int) -> str | NavigationAction:
@@ -464,7 +447,7 @@ def _read_once(host: str, port: int, unit_id: int) -> str | NavigationAction:
         if run_operation:
             def operation(client: ModbusTcpClient) -> str:
                 values = read_values(client, area, address, count, unit_id)
-                return f"{area.value.title()} at address {address}: {values}"
+                return format_read_table(area, address, values)
 
             result = _run_and_report(host, port, unit_id, operation)
             run_operation = False
@@ -597,24 +580,36 @@ def _start_periodic_read(
         return NavigationAction.BACK_TO_MAIN
     return (
         f"Periodic read session {session.session_id} ended after "
-        f"{session.cycles} cycle(s). Latest values: {session.last_result}"
+        f"{session.cycles} cycle(s)."
     )
 
 
 def _control_periodic_read(
     sessions: SessionManager, session: OperationSession
 ) -> NavigationAction:
+    assert session.count is not None
+    page_size = max(1, shutil.get_terminal_size(fallback=(80, 24)).lines - 23)
+    page_count = max(1, (session.count + page_size - 1) // page_size)
+    page_index = 0
+
     while True:
         if session.state in ("running", "paused"):
             toggle_label = "Pause reading" if session.state == "running" else "Resume reading"
-            options = (toggle_label,)
+            options = [toggle_label]
+            if page_count > 1:
+                if page_index < page_count - 1:
+                    options.append("Next table page")
+                if page_index > 0:
+                    options.append("Previous table page")
         else:
-            options = ()
+            options = []
         choice = _show_menu(
-            options,
+            tuple(options),
             "Periodic read",
             subtitle=f"{session.description}; every {session.interval:g}s; {session.state}",
-            prologue_text=lambda: _single_read_status(session),
+            prologue_text=lambda: _single_read_status(
+                session, page_index * page_size, page_size, page_count
+            ),
             refresh_interval=1 if session.state == "running" else None,
         )
         if session.state not in ("running", "paused"):
@@ -631,14 +626,47 @@ def _control_periodic_read(
         elif choice == -1:
             sessions.stop(session.session_id)
             return NavigationAction.BACK
+        elif 0 <= choice < len(options):
+            selected_action = options[choice]
+            if selected_action == "Next table page":
+                page_index += 1
+            elif selected_action == "Previous table page":
+                page_index -= 1
 
 
-def _single_read_status(session: OperationSession) -> str:
-    details = [
-        f"Cycle {session.cycles}  |  Updated {session.updated_at:%H:%M:%S}",
-        _fit_status_line(f"Latest values: {session.last_result}"),
-        _fit_status_line(f"Latest error: {session.last_error or 'None'}"),
-    ]
+def _single_read_status(
+    session: OperationSession,
+    offset_start: int = 0,
+    page_size: int | None = None,
+    page_count: int = 1,
+) -> str:
+    count = session.count
+    row_count = (
+        min(page_size, max(0, count - offset_start))
+        if page_size is not None and count is not None
+        else count
+    )
+    values = (
+        session.last_values[offset_start : offset_start + row_count]
+        if session.last_values is not None and row_count is not None
+        else session.last_values
+    )
+    details = [f"Cycle {session.cycles}  |  Updated {session.updated_at:%H:%M:%S}"]
+    if page_count > 1 and row_count is not None:
+        details.append(
+            f"Showing offsets {offset_start}-{offset_start + row_count - 1} "
+            f"(page {offset_start // (page_size or 1) + 1}/{page_count})"
+        )
+    details.extend((
+        format_read_table(
+            session.area,
+            session.address,
+            values,
+            row_count,
+            offset_start=offset_start,
+        ),
+        f"Latest error: {session.last_error or 'None'}",
+    ))
     return "\n".join(details)
 
 
@@ -676,7 +704,17 @@ def _manage_sessions(sessions: SessionManager) -> str | NavigationAction:
                 f"at {session.host}:{session.port}, unit {session.unit_id}; "
                 f"{session.cycles} cycles; updated {session.updated_at:%H:%M:%S}"
             )
-            details.append(f"  Latest result: {session.last_result}")
+            if session.values is None:
+                details.append(
+                    format_read_table(
+                        session.area,
+                        session.address,
+                        session.last_values,
+                        session.count,
+                    )
+                )
+            else:
+                details.append(f"  Latest result: {session.last_result}")
             if session.last_error:
                 details.append(f"  Latest error: {session.last_error}")
         if last_message:
