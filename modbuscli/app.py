@@ -574,6 +574,7 @@ def _start_periodic_read(
         if interval is NavigationAction.BACK_TO_MAIN:
             return interval
         break
+    assert interval is not None
     session = sessions.start_read(host, port, unit_id, area, address, count, interval)
     navigation = _control_periodic_read(sessions, session)
     if navigation is NavigationAction.BACK_TO_MAIN:
@@ -678,16 +679,17 @@ def _start_periodic_write(
         if isinstance(settings, NavigationAction):
             return settings
         area, address, values = settings
-        interval = _prompt_interval()
+        interval = _prompt_interval(optional=True)
         if interval is NavigationAction.BACK:
             continue
         if interval is NavigationAction.BACK_TO_MAIN:
             return interval
         break
     session = sessions.start_write(host, port, unit_id, area, address, values, interval)
+    cadence = "as fast as possible" if interval is None else f"every {interval:g}s"
     return (
         f"Started background write session {session.session_id}: "
-        f"{session.description} every {interval:g}s."
+        f"{session.description} {cadence}."
     )
 
 
@@ -869,16 +871,25 @@ def _prompt_write_values(
             _print_dialog("Invalid write values", str(error))
 
 
-def _prompt_interval() -> float | NavigationAction:
+def _prompt_interval(
+    optional: bool = False,
+) -> float | None | NavigationAction:
     while True:
+        prompt = (
+            "Interval in seconds (minimum 0.1; leave blank for as fast as possible)"
+            if optional
+            else "Interval in seconds (minimum 0.1)"
+        )
         raw_value = _boxed_input(
             "Periodic interval",
-            "Interval in seconds (minimum 0.1)",
+            prompt,
             allow_navigation=True,
         )
         navigation = _parse_navigation_action(raw_value)
         if navigation is not None:
             return navigation
+        if optional and not raw_value.strip():
+            return None
         try:
             interval = float(raw_value)
             if interval < 0.1 or not isfinite(interval):
