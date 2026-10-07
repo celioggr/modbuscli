@@ -37,7 +37,21 @@ The Modbus CLI supports the most commonly used Modbus functions for reading and 
 The tool supports running multiple Modbus sessions in parallel. This allows different operations to execute simultaneously, for example:
 
 - Continuously writing to a coil
+- Monitoring coil values from another session to observe state changes in real time.
+- Running independent read and write operations against the same or different devices.
+ 
+This makes it possible to simulate device behavior, test automation logic, and monitor changes without interrupting other active sessions.
 
+## Screenshots 
+![](./images/modbuscli01.png)
+ 
+![](./images/modbuscli02.png)
+ 
+![](./images/modbuscli03.png)
+ 
+![](./images/modbuscli04.png)
+ 
+![](./images/modbuscli05.png)
 
 ## Run
 
