@@ -19,7 +19,7 @@ class OperationSession:
     host: str
     port: int
     unit_id: int
-    interval: float
+    interval: float | None
     area: DataArea
     address: int
     count: int | None = None
@@ -47,7 +47,14 @@ class SessionManager:
         return self._start(host, port, unit_id, area, address, count, None, interval, description)
 
     def start_write(
-        self, host: str, port: int, unit_id: int, area: DataArea, address: int, values: list[int], interval: float
+        self,
+        host: str,
+        port: int,
+        unit_id: int,
+        area: DataArea,
+        address: int,
+        values: list[int],
+        interval: float | None = None,
     ) -> OperationSession:
         description = f"Write {len(values)} {area.value} at address {address}"
         return self._start(host, port, unit_id, area, address, None, values.copy(), interval, description)
@@ -61,7 +68,7 @@ class SessionManager:
         address: int,
         count: int | None,
         values: list[int] | None,
-        interval: float,
+        interval: float | None,
         description: str,
     ) -> OperationSession:
         if not host.strip():
@@ -70,7 +77,9 @@ class SessionManager:
             raise ValueError("TCP port must be between 1 and 65535.")
         if not 0 <= unit_id <= 255:
             raise ValueError("Unit ID must be between 0 and 255.")
-        if interval < 0.1 or not isfinite(interval):
+        if interval is None and values is None:
+            raise ValueError("Read interval must be a finite value of at least 0.1 seconds.")
+        if interval is not None and (interval < 0.1 or not isfinite(interval)):
             raise ValueError("Interval must be a finite value of at least 0.1 seconds.")
         if values is None:
             assert count is not None
@@ -179,11 +188,12 @@ class SessionManager:
                     except Exception as error:
                         client.close()
                         self._update(session, error=str(error))
-                    next_run += session.interval
-                    delay = max(0.0, next_run - monotonic())
-                    next_run = max(next_run, monotonic())
-                    if session.stop_event.wait(delay):
-                        break
+                    if session.interval is not None:
+                        next_run += session.interval
+                        delay = max(0.0, next_run - monotonic())
+                        next_run = max(next_run, monotonic())
+                        if session.stop_event.wait(delay):
+                            break
         except Exception as error:
             self._update(session, error=str(error), state="failed")
             return
