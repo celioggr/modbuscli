@@ -1,0 +1,2 @@
+console-menu>=0.8.0,<0.9
+pymodbus>=3.8,<4

@@ -55,27 +55,18 @@ This makes it possible to simulate device behavior, test automation logic, and m
 
 ## Run
 
-From the project directory:
+From the source tree using virtual envs:
 
 ```powershell
-py -m pip install .
-modbuscli
-```
-
-Or run directly from the source tree:
-
-```powershell
-py -m modbuscli
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install -r requirements.txt
+python3 -m modbuscli
 ```
 
 The default connection is `127.0.0.1:502`, Unit ID `1`. Change it in the
 Configure connection menu.
 
-## Compile
-
-```powershell
-py -m compileall -q modbuscli
-```
 
 ## To Do
 - Scanning for active mobbus unit IDs 
