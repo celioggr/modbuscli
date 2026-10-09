@@ -16,9 +16,17 @@ from consolemenu.items import FunctionItem
 from consolemenu.screen import Screen
 from pymodbus.client import ModbusTcpClient
 
+from .monitor import (
+    DATA_AREAS,
+    MonitorConfig,
+    MonitorRange,
+    MonitorWorker,
+)
+from .monitor_view import run_monitor
 from .operations import DataArea, read_values, validate_address_count, validate_write_values, write_values
 from .presentation import format_read_table
 from .sessions import OperationSession, SessionManager, run_once
+from .terminal import paint, supports_color
 
 
 class NavigationAction(Enum):
@@ -36,11 +44,17 @@ def main() -> None:
     port = 502
     unit_id = 1
     sessions = SessionManager()
+    monitor_config = MonitorConfig()
 
     try:
         while True:
             choice = _show_menu(
-                ("Client mode", "Configure connection"),
+                (
+                    "Client mode",
+                    "Monitor & Interact",
+                    "Manage sessions",
+                    "Configure connection",
+                ),
                 "Modbus CLI",
                 subtitle=_connection_subtitle(host, port, unit_id),
                 navigation=False,
@@ -50,6 +64,12 @@ def main() -> None:
             if choice == 0:
                 _client_menu(sessions, host, port, unit_id)
             elif choice == 1:
+                monitor_config = _monitor_menu(
+                    host, port, unit_id, monitor_config
+                )
+            elif choice == 2:
+                _manage_sessions(sessions)
+            elif choice == 3:
                 configured = _configure_connection(host, port, unit_id)
                 if isinstance(configured, tuple):
                     host, port, unit_id = configured
@@ -64,18 +84,11 @@ def _clear_screen() -> None:
 
 
 def _supports_color() -> bool:
-    return (
-        sys.stdout.isatty()
-        and "NO_COLOR" not in os.environ
-        and os.environ.get("TERM", "").lower() != "dumb"
-    )
+    return supports_color()
 
 
 def _paint(text: str, color: str, bold: bool = False) -> str:
-    if not _supports_color():
-        return text
-    style = f"\033[{1 if bold else 0};{color}m"
-    return f"{style}{text}\033[0m"
+    return paint(text, color, bold, enabled=_supports_color())
 
 
 def _print_banner() -> None:
@@ -434,6 +447,82 @@ def _client_menu(sessions: SessionManager, host: str, port: int, unit_id: int) -
             last_message = ""
             continue
         last_message = result
+
+
+def _monitor_menu(
+    host: str, port: int, unit_id: int, config: MonitorConfig
+) -> MonitorConfig:
+    while True:
+        choice = _show_menu(
+            ("Start Monitor", "Configure Monitor"),
+            "Monitor & Interact",
+            subtitle=_monitor_config_summary(config),
+        )
+        if choice in (-1, -2):
+            return config
+        if choice == 0:
+            worker = MonitorWorker(host, port, unit_id, config)
+            worker.start()
+            try:
+                run_monitor(
+                    worker,
+                    lambda timeout: KeypressScreen()._read_key(timeout=timeout),
+                )
+            finally:
+                worker.stop()
+        elif choice == 1:
+            configured = _configure_monitor(config)
+            if isinstance(configured, MonitorConfig):
+                config = configured
+            elif configured is NavigationAction.BACK_TO_MAIN:
+                return config
+
+
+def _monitor_config_summary(config: MonitorConfig) -> str:
+    ranges = " | ".join(
+        f"{area.menu_label}: {address_range.offset}+{address_range.count}"
+        for area, address_range in config.ranges.items()
+    )
+    return f"{ranges}\nPolling interval: {config.interval:g}s"
+
+
+def _configure_monitor(
+    config: MonitorConfig,
+) -> MonitorConfig | NavigationAction:
+    ranges: dict[DataArea, MonitorRange] = {}
+    for area in DATA_AREAS:
+        current = config.ranges[area]
+        offset = _prompt_int(
+            f"{area.menu_label} start offset",
+            0,
+            65535,
+            default=current.offset,
+        )
+        if isinstance(offset, NavigationAction):
+            return offset
+        max_count = (
+            2000
+            if area in (DataArea.COILS, DataArea.DISCRETE_INPUTS)
+            else 125
+        )
+        count = _prompt_int(
+            f"{area.menu_label} count",
+            1,
+            max_count,
+            default=current.count,
+        )
+        if isinstance(count, NavigationAction):
+            return count
+        ranges[area] = MonitorRange(offset, count)
+
+    interval = _prompt_interval()
+    if isinstance(interval, NavigationAction):
+        return interval
+    try:
+        return MonitorConfig(ranges=ranges, interval=interval)
+    except ValueError as error:
+        _print_dialog("Invalid monitor configuration", str(error))
+        return NavigationAction.BACK
 
 
 def _read_once(host: str, port: int, unit_id: int) -> str | NavigationAction:
