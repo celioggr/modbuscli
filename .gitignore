@@ -1,2 +1,3 @@
 /modbuscli.egg-info
-/tests
+/tests/*
+!/tests/test_monitor.py
