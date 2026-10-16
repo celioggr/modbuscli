@@ -42,6 +42,37 @@ The tool supports running multiple Modbus sessions in parallel. This allows diff
  
 This makes it possible to simulate device behavior, test automation logic, and monitor changes without interrupting other active sessions.
 
+### Monitor & Interact
+
+**Monitor & Interact** gives you a live view of the Modbus data areas while polling continues in the background. This is especially useful when exploring more complex systems, as you can quickly see **which values are changing and how the system responds when you interact with it**.
+
+The monitor displays 10 values from each area by default, with configurable offsets, ranges, and polling intervals. Changes are highlighted and added to a recent-event history.
+
+From the `monitor>` prompt, you can perform one-time, range, and continuous writes to coils and holding registers:
+
+```text
+hr 0=999
+c 2=off
+c 1-10=on
+repeat hr 4=321
+repeat c 1-10=on every 0.5s
+pause 1
+resume 1
+stop 1
+pause
+resume
+clear
+status
+help
+quit
+```
+
+`hr` targets holding registers and `c` targets coils. Ranges are inclusive, so `c 1-10=on` writes ten coils. Continuous writes can be paused, resumed, or stopped individually using their ID, while `pause` and `resume` without an ID control monitor polling.
+
+**Client mode** remains available for standard individual and periodic read/write operations.
+
+
+
 ## Screenshots 
 ![](./images/modbuscli01.png)
  
@@ -52,6 +83,8 @@ This makes it possible to simulate device behavior, test automation logic, and m
 ![](./images/modbuscli04.png)
  
 ![](./images/modbuscli05.png)
+
+![](./images/modbuscli06.png)
 
 ## Run
 

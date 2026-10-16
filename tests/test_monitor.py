@@ -1,21 +1,24 @@
 import time
 import unittest
 import re
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from modbuscli import app
 from modbuscli.monitor import (
     AREA_ABBREVIATIONS,
+    ContinuousWriteDisplay,
     DATA_AREAS,
     MAX_EVENT_HISTORY,
     MonitorCommandKind,
     MonitorConfig,
+    MonitorEvent,
     MonitorRange,
     MonitorState,
     MonitorWorker,
     parse_monitor_command,
 )
-from modbuscli.monitor_view import render_monitor
+from modbuscli.monitor_view import render_monitor, update_monitor_screen
 from modbuscli.operations import DataArea
 
 
@@ -34,6 +37,7 @@ class FakeClient:
     def __init__(self, *args, **kwargs):
         self.calls = []
         self.read_addresses = []
+        self.writes = []
         self.closed = False
         self.fail_discrete_inputs = False
 
@@ -66,10 +70,22 @@ class FakeClient:
 
     def write_register(self, address, value, **kwargs):
         self.calls.append("write_register")
+        self.writes.append(("write_register", address, (value,)))
         return Response(1)
+
+    def write_registers(self, address, values, **kwargs):
+        self.calls.append("write_registers")
+        self.writes.append(("write_registers", address, tuple(values)))
+        return Response(len(values))
 
     def write_coil(self, address, value, **kwargs):
         self.calls.append("write_coil")
+        self.writes.append(("write_coil", address, (int(value),)))
+        return Response(1)
+
+    def write_coils(self, address, values, **kwargs):
+        self.calls.append("write_coils")
+        self.writes.append(("write_coils", address, tuple(map(int, values))))
         return Response(1)
 
 
@@ -152,6 +168,55 @@ class MonitorTests(unittest.TestCase):
         ):
             with self.subTest(expression=expression):
                 self.assertEqual(parse_monitor_command(expression).value, expected)
+
+    def test_range_write_parses_inclusive_offsets_and_replicated_value(self):
+        command = parse_monitor_command("c 1-10=on")
+        register_command = parse_monitor_command("hr 40-42=999")
+
+        self.assertEqual(
+            (command.offset, command.end_offset, command.value),
+            (1, 10, 1),
+        )
+        self.assertEqual(
+            (
+                register_command.area,
+                register_command.offset,
+                register_command.end_offset,
+                register_command.value,
+            ),
+            (DataArea.HOLDING_REGISTERS, 40, 42, 999),
+        )
+
+    def test_continuous_write_commands_parse_default_and_custom_interval(self):
+        fastest = parse_monitor_command("repeat c 1-10=on")
+        timed = parse_monitor_command("repeat hr 4=321 every 0.25s")
+        pause = parse_monitor_command("pause 1")
+        resume = parse_monitor_command("resume 1")
+        stop = parse_monitor_command("stop 1")
+
+        self.assertEqual(fastest.kind, MonitorCommandKind.START_CONTINUOUS)
+        self.assertIsNone(fastest.interval)
+        self.assertEqual(timed.interval, 0.25)
+        self.assertEqual(timed.value, 321)
+        self.assertEqual(pause.kind, MonitorCommandKind.PAUSE_CONTINUOUS)
+        self.assertEqual(pause.writer_id, 1)
+        self.assertEqual(resume.kind, MonitorCommandKind.RESUME_CONTINUOUS)
+        self.assertEqual(stop.kind, MonitorCommandKind.STOP_CONTINUOUS)
+        self.assertEqual(stop.writer_id, 1)
+        with self.assertRaisesRegex(ValueError, "ID must be greater than zero"):
+            parse_monitor_command("pause 0")
+
+    def test_invalid_write_ranges_and_continuous_intervals_are_rejected(self):
+        for expression in (
+            "c 10-1=on",
+            "hr 0-123=1",
+            "c 65535-65536=on",
+            "repeat c 0=on every 0s",
+            "repeat hr 0=1 every 1e999s",
+        ):
+            with self.subTest(expression=expression):
+                with self.assertRaises(ValueError):
+                    parse_monitor_command(expression)
 
     def test_read_only_data_areas_are_rejected(self):
         for expression, message in (
@@ -267,6 +332,97 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(any(event.kind == "WRITE" for event in events))
         self.assertTrue(any(event.kind == "MISMATCH" for event in events))
 
+    def test_worker_executes_multiple_writes_as_a_single_range_write(self):
+        client = FakeClient()
+        worker = MonitorWorker("localhost", 502, 1, MonitorConfig(interval=1))
+        with patch("modbuscli.monitor.ModbusTcpClient", return_value=client):
+            worker.start()
+            worker.submit_write(DataArea.COILS, 1, [1] * 10)
+            deadline = time.monotonic() + 2
+            while not client.writes and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker.stop()
+
+        self.assertIn(("write_coils", 1, (1,) * 10), client.writes)
+
+    def test_continuous_write_runs_until_stopped(self):
+        client = FakeClient()
+        worker = MonitorWorker("localhost", 502, 1, MonitorConfig(interval=1))
+        with patch("modbuscli.monitor.ModbusTcpClient", return_value=client):
+            worker.start()
+            writer_id = worker.start_continuous_write(
+                DataArea.COILS, 1, [1] * 10
+            )
+            deadline = time.monotonic() + 2
+            while len(client.writes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker.stop_continuous_write(writer_id)
+            deadline = time.monotonic() + 2
+            while (
+                not any(
+                    event.kind == "CONTINUOUS_STOPPED"
+                    for event in worker.state.display().events
+                )
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            stopped_count = len(client.writes)
+            time.sleep(0.05)
+            final_count = len(client.writes)
+            events = worker.state.display().events
+            worker.stop()
+
+        self.assertGreaterEqual(stopped_count, 2)
+        self.assertEqual(final_count, stopped_count)
+        self.assertTrue(any(event.kind == "CONTINUOUS_STARTED" for event in events))
+        self.assertTrue(any(event.kind == "CONTINUOUS_STOPPED" for event in events))
+
+    def test_timed_continuous_write_repeats_after_requested_interval(self):
+        client = FakeClient()
+        worker = MonitorWorker("localhost", 502, 1, MonitorConfig(interval=1))
+        with patch("modbuscli.monitor.ModbusTcpClient", return_value=client):
+            worker.start()
+            worker.start_continuous_write(
+                DataArea.HOLDING_REGISTERS, 4, [321], interval=0.05
+            )
+            deadline = time.monotonic() + 2
+            while len(client.writes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker.stop()
+
+        self.assertGreaterEqual(len(client.writes), 2)
+        self.assertTrue(all(call[0] == "write_register" for call in client.writes))
+
+    def test_continuous_write_can_be_paused_and_resumed(self):
+        client = FakeClient()
+        worker = MonitorWorker("localhost", 502, 1, MonitorConfig(interval=1))
+        with patch("modbuscli.monitor.ModbusTcpClient", return_value=client):
+            worker.start()
+            writer_id = worker.start_continuous_write(
+                DataArea.COILS, 1, [1] * 10
+            )
+            deadline = time.monotonic() + 2
+            while len(client.writes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker.pause_continuous_write(writer_id)
+            deadline = time.monotonic() + 2
+            while (
+                not worker.state.display().continuous_writes
+                or not worker.state.display().continuous_writes[0].paused
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            paused_count = len(client.writes)
+            time.sleep(0.05)
+            count_while_paused = len(client.writes)
+            worker.resume_continuous_write(writer_id)
+            deadline = time.monotonic() + 2
+            while len(client.writes) == count_while_paused and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker.stop()
+
+        self.assertEqual(count_while_paused, paused_count)
+        self.assertGreater(len(client.writes), count_while_paused)
+
     def test_worker_reads_back_write_outside_monitored_range(self):
         ranges = MonitorConfig().ranges.copy()
         ranges[DataArea.HOLDING_REGISTERS] = MonitorRange(0, 1)
@@ -337,13 +493,14 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Holding Registers (4x)", wide)
         self.assertIn("Discrete Inputs (1x)", narrow)
         self.assertIn("monitor>", narrow)
-        self.assertEqual(len(compact.splitlines()), 12)
-        self.assertTrue(compact.splitlines()[-2].startswith("|  monitor>"))
-        self.assertTrue(compact.splitlines()[-1].startswith("+"))
+        self.assertIn("Recent Changes", compact)
+        self.assertIn("monitor>", compact)
+        self.assertIn("yellow = recently changed", compact)
 
-    def test_monitor_uses_ascii_box_and_existing_terminal_colors(self):
+    def test_monitor_data_rows_are_unbordered_and_use_terminal_colors(self):
         state = MonitorState(MonitorConfig())
         state.set_status("RUNNING")
+        state.record_read_error(DataArea.HOLDING_REGISTERS, "test failure")
         with patch("modbuscli.terminal.supports_color", return_value=True):
             frame = render_monitor(
                 state.display(),
@@ -361,12 +518,228 @@ class MonitorTests(unittest.TestCase):
             re.sub(r"\x1b\[[0-9;]*m", "", line)
             for line in frame.splitlines()
         ]
-        self.assertTrue(visible_lines[0].startswith("+"))
-        self.assertTrue(visible_lines[-1].startswith("+"))
-        self.assertTrue(all(len(line) == 100 for line in visible_lines))
-        self.assertIn("\x1b[1;31m", frame)
+        log_index = next(
+            index for index, line in enumerate(visible_lines) if "Recent Changes" in line
+        )
+        self.assertFalse(any(line.startswith("+-") for line in visible_lines[:log_index - 1]))
+        self.assertTrue(any(line.startswith("+-") for line in visible_lines[log_index - 1:]))
+        self.assertIn("Changes observed: 0", frame)
+        self.assertIn("white = normal", "\n".join(visible_lines))
         self.assertIn("\x1b[1;91m", frame)
         self.assertIn("\x1b[1;92m", frame)
+
+    def test_screen_refresh_writes_only_changed_rows(self):
+        previous = "header\ncoil row\nregister row\nmonitor> \nlegend"
+        current = "header\ncoil row changed\nregister row\nmonitor> \nlegend"
+
+        update = update_monitor_screen(current, previous)
+
+        self.assertNotIn("\033[2J", update)
+        self.assertIn("\033[2;1H\033[2Kcoil row changed", update)
+        self.assertNotIn("register row", update)
+        self.assertNotIn("legend", update)
+
+    def test_screen_update_does_not_redraw_when_nothing_changed(self):
+        frame = "header\nvalues\nmonitor> \nlegend"
+
+        self.assertEqual(update_monitor_screen(frame, frame), "")
+
+    def test_command_feedback_is_rendered_immediately_after_prompt(self):
+        state = MonitorState(MonitorConfig())
+        frame = render_monitor(
+            state.display(),
+            state.config.ranges,
+            "localhost",
+            502,
+            1,
+            1,
+            "",
+            notice="Polling paused. Writes remain enabled.",
+            width=100,
+            height=24,
+        )
+        lines = frame.splitlines()
+        prompt_index = next(
+            index for index, line in enumerate(lines) if line.startswith("monitor>")
+        )
+
+        self.assertEqual(lines[prompt_index + 1].strip(), "Polling paused. Writes remain enabled.")
+        self.assertGreater(
+            prompt_index,
+            next(index for index, line in enumerate(lines) if "Recent Changes" in line),
+        )
+
+    def test_recently_changed_highlight_expires_after_five_seconds(self):
+        state = MonitorState(MonitorConfig())
+        state.record_read(DataArea.HOLDING_REGISTERS, [123])
+        state.record_read(DataArea.HOLDING_REGISTERS, [456])
+        now = datetime.now()
+        with patch("modbuscli.terminal.supports_color", return_value=True):
+            recent_frame = render_monitor(
+                state.display(),
+                state.config.ranges,
+                "localhost",
+                502,
+                1,
+                1,
+                "",
+                width=120,
+                height=30,
+                now=now,
+            )
+            expired_frame = render_monitor(
+                state.display(),
+                state.config.ranges,
+                "localhost",
+                502,
+                1,
+                1,
+                "",
+                width=120,
+                height=30,
+                now=now + timedelta(seconds=6),
+            )
+
+        def value_row(frame):
+            return next(
+                line
+                for line in frame.splitlines()
+                if "456" in re.sub(r"\x1b\[[0-9;]*m", "", line)
+            )
+
+        self.assertIn("\x1b[1;93m", value_row(recent_frame))
+        self.assertNotIn("\x1b[1;93m", value_row(expired_frame))
+
+    def test_recent_changes_panel_has_its_own_border(self):
+        state = MonitorState(MonitorConfig())
+        state._events.append(
+            MonitorEvent(datetime.now(), "CHANGE", "HR[0] 123 -> 999")
+        )
+        frame = render_monitor(
+            state.display(),
+            state.config.ranges,
+            "localhost",
+            502,
+            1,
+            1,
+            "",
+            width=120,
+            height=30,
+        )
+        visible = [
+            re.sub(r"\x1b\[[0-9;]*m", "", line)
+            for line in frame.splitlines()
+        ]
+        title_index = next(
+            index for index, line in enumerate(visible) if "Recent Changes" in line
+        )
+
+        self.assertTrue(visible[title_index - 1].startswith("+-"))
+        self.assertTrue(visible[title_index + 1].startswith("+-"))
+        self.assertIn("HR[0] 123 -> 999", visible[title_index + 2])
+
+    def test_ongoing_continuous_writes_panel_follows_recent_changes(self):
+        state = MonitorState(MonitorConfig())
+        state.set_continuous_writes(
+            (
+                ContinuousWriteDisplay(
+                    1, DataArea.COILS, 1, (1,) * 10, None, False
+                ),
+            )
+        )
+        frame = render_monitor(
+            state.display(),
+            state.config.ranges,
+            "localhost",
+            502,
+            1,
+            1,
+            "",
+            width=120,
+            height=30,
+        )
+        visible = [
+            re.sub(r"\x1b\[[0-9;]*m", "", line)
+            for line in frame.splitlines()
+        ]
+        recent_index = next(
+            index for index, line in enumerate(visible) if "Recent Changes" in line
+        )
+        ongoing_index = next(
+            index
+            for index, line in enumerate(visible)
+            if "Ongoing Continuous Writes" in line
+        )
+
+        self.assertGreater(ongoing_index, recent_index)
+        self.assertEqual(
+            sum("Ongoing Continuous Writes" in line for line in visible), 1
+        )
+        self.assertTrue(visible[ongoing_index - 1].startswith("+-"))
+        self.assertTrue(visible[ongoing_index + 1].startswith("+-"))
+        ongoing_text = "\n".join(visible[ongoing_index:])
+        self.assertIn("C[1-10] = ON", ongoing_text)
+        self.assertIn("RUNNING", ongoing_text)
+        self.assertIn("#1", ongoing_text)
+        self.assertIn("pause 1", ongoing_text)
+        self.assertIn("stop 1", ongoing_text)
+
+    def test_continuous_write_panel_does_not_overlap_recent_changes_at_height_limit(self):
+        state = MonitorState(MonitorConfig())
+        state.set_continuous_writes(
+            (
+                ContinuousWriteDisplay(
+                    1, DataArea.COILS, 1, (1,) * 10, 1.0, False
+                ),
+                ContinuousWriteDisplay(
+                    2, DataArea.HOLDING_REGISTERS, 4, (321,), 3.0, True
+                ),
+            )
+        )
+        for index in range(4):
+            state._events.append(
+                MonitorEvent(
+                    datetime.now(),
+                    "CHANGE",
+                    f"HR[{index}] {index} -> {index + 1}",
+                )
+            )
+
+        frame = render_monitor(
+            state.display(),
+            state.config.ranges,
+            "localhost",
+            502,
+            1,
+            1,
+            "",
+            width=180,
+            height=20,
+        )
+        visible = [
+            re.sub(r"\x1b\[[0-9;]*m", "", line)
+            for line in frame.splitlines()
+        ]
+        recent_index = next(
+            index for index, line in enumerate(visible) if "Recent Changes" in line
+        )
+        ongoing_index = next(
+            index
+            for index, line in enumerate(visible)
+            if "Ongoing Continuous Writes" in line
+        )
+        recent_bottom = next(
+            index
+            for index in range(recent_index + 2, ongoing_index)
+            if visible[index].startswith("+-")
+        )
+
+        self.assertLessEqual(len(visible), 20)
+        self.assertTrue(visible[recent_index - 1].startswith("+-"))
+        self.assertTrue(visible[recent_bottom].startswith("+-"))
+        self.assertEqual(visible[recent_bottom + 1], visible[ongoing_index - 1])
+        self.assertIn("#1", visible[ongoing_index + 2])
+        self.assertIn("#2", "\n".join(visible[ongoing_index:]))
 
     def test_main_menu_includes_monitor_and_manage_sessions(self):
         config = MonitorConfig()
