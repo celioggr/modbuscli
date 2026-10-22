@@ -69,6 +69,8 @@ quit
 
 `hr` targets holding registers and `c` targets coils. Ranges are inclusive, so `c 1-10=on` writes ten coils. Continuous writes can be paused, resumed, or stopped individually using their ID, while `pause` and `resume` without an ID control monitor polling.
 
+Successful Monitor commands are stored in memory and can be navigated using the Up/Down arrow keys, similar to Bash command history.
+
 **Client mode** remains available for standard individual and periodic read/write operations.
 
 
