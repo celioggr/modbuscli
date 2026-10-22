@@ -252,6 +252,10 @@ def _show_menu(
 
 
 class KeypressScreen(Screen):
+    def __init__(self) -> None:
+        super().__init__()
+        self._discarding_ansi_sequence: str | None = None
+
     def input(self, prompt: str = "") -> str:
         return self._read_key(prompt)
 
@@ -260,11 +264,13 @@ class KeypressScreen(Screen):
             import msvcrt
 
             if timeout is None:
-                return msvcrt.getwch()
+                key = msvcrt.getwch()
+                return self._decode_windows_key(key, msvcrt.getwch)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if msvcrt.kbhit():
-                    return msvcrt.getwch()
+                    key = msvcrt.getwch()
+                    return self._decode_windows_key(key, msvcrt.getwch)
                 time.sleep(0.05)
             return ""
         if not sys.stdin.isatty():
@@ -279,12 +285,65 @@ class KeypressScreen(Screen):
         try:
             tty.setcbreak(descriptor)
             if timeout is not None:
-                readable, _, _ = select.select([sys.stdin], [], [], timeout)
+                readable, _, _ = select.select([descriptor], [], [], timeout)
                 if not readable:
                     return ""
-            return sys.stdin.read(1)
+            key = os.read(descriptor, 1).decode("utf-8", errors="replace")
+            if self._discarding_ansi_sequence == "escape":
+                self._discarding_ansi_sequence = (
+                    "sequence" if key in ("[", "O") else None
+                )
+                return ""
+            if self._discarding_ansi_sequence == "sequence":
+                if "\x40" <= key <= "\x7e":
+                    self._discarding_ansi_sequence = None
+                return ""
+            if key == "\x1b":
+                readable, _, _ = select.select([descriptor], [], [], 0.03)
+                if not readable:
+                    self._discarding_ansi_sequence = "escape"
+                    return ""
+                sequence = key + os.read(descriptor, 1).decode(
+                    "utf-8", errors="replace"
+                )
+                if sequence in ("\x1b[", "\x1bO"):
+                    while True:
+                        readable, _, _ = select.select([descriptor], [], [], 0.03)
+                        if not readable:
+                            self._discarding_ansi_sequence = "sequence"
+                            return ""
+                        next_character = os.read(descriptor, 1).decode(
+                            "utf-8", errors="replace"
+                        )
+                        sequence += next_character
+                        if "\x40" <= next_character <= "\x7e":
+                            break
+                return self._decode_arrow_sequence(sequence)
+            return key
         finally:
             termios.tcsetattr(descriptor, termios.TCSADRAIN, old_settings)
+
+    @staticmethod
+    def _decode_windows_key(key: str, read_key: Callable[[], str]) -> str:
+        if key not in ("\x00", "\xe0"):
+            return key
+        sequence = key + read_key()
+        return {
+            "\x00H": "UP",
+            "\x00P": "DOWN",
+            "\xe0H": "UP",
+            "\xe0P": "DOWN",
+        }.get(sequence, "")
+
+    @staticmethod
+    def _decode_arrow_sequence(sequence: str) -> str:
+        if sequence in ("\x1b[A", "\x1bOA"):
+            return "UP"
+        if sequence in ("\x1b[B", "\x1bOB"):
+            return "DOWN"
+        if sequence.startswith("\x1b"):
+            return ""
+        return sequence
 
 
 class RefreshingScreen(KeypressScreen):
@@ -462,11 +521,12 @@ def _monitor_menu(
             return config
         if choice == 0:
             worker = MonitorWorker(host, port, unit_id, config)
+            key_screen = KeypressScreen()
             worker.start()
             try:
                 run_monitor(
                     worker,
-                    lambda timeout: KeypressScreen()._read_key(timeout=timeout),
+                    lambda timeout: key_screen._read_key(timeout=timeout),
                 )
             finally:
                 worker.stop()

@@ -3,7 +3,9 @@ import shutil
 import sys
 import textwrap
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 
 from .monitor import (
     AREA_ABBREVIATIONS,
@@ -26,6 +28,55 @@ RECENT_CHANGE_SECONDS = 5
 _CHANGE_EVENT = re.compile(r"([A-Z]+)\[(\d+)\]")
 
 
+class _CommandHistory:
+    def __init__(self) -> None:
+        self._commands: list[str] = []
+        self._position = 0
+        self._draft = ""
+        self._navigating = False
+
+    def submit(self, command: str) -> None:
+        if command.strip():
+            self._commands.append(command)
+        self._position = len(self._commands)
+        self._draft = ""
+        self._navigating = False
+
+    def previous(self, current: str) -> str:
+        if not self._commands:
+            return current
+        if not self._navigating:
+            self._draft = current
+            self._position = len(self._commands)
+            self._navigating = True
+        self._position = max(0, self._position - 1)
+        return self._commands[self._position]
+
+    def next(self, current: str) -> str:
+        if not self._navigating:
+            return current
+        self._position = min(len(self._commands), self._position + 1)
+        if self._position == len(self._commands):
+            self._navigating = False
+            return self._draft
+        return self._commands[self._position]
+
+
+class _CommandOutputKind(Enum):
+    SILENT = "silent"
+    HELP = "help"
+    CLEAR = "clear"
+    ERROR = "error"
+    EXIT = "exit"
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    output_kind: _CommandOutputKind
+    output: str = ""
+    scroll_offset: int = 0
+
+
 def render_monitor(
     state: MonitorDisplayState,
     ranges: dict[DataArea, MonitorRange],
@@ -34,7 +85,7 @@ def render_monitor(
     unit_id: int,
     interval: float,
     command_buffer: str,
-    notice: str = "",
+    command_output: str = "",
     scroll_offset: int = 0,
     width: int | None = None,
     height: int | None = None,
@@ -45,9 +96,21 @@ def render_monitor(
     height = max(12, height or terminal.lines)
     content_width = width - 2
     wide = width >= MIN_FOUR_COLUMN_WIDTH
-    feedback_lines = (
-        textwrap.wrap(notice.replace("\n", " "), width=max(20, content_width - 2))
-        if notice
+    output_lines = (
+        [
+            line
+            for output_line in command_output.splitlines()
+            for line in (
+                textwrap.wrap(
+                    output_line,
+                    width=max(20, content_width - 2),
+                    replace_whitespace=False,
+                    drop_whitespace=False,
+                )
+                or [""]
+            )
+        ]
+        if command_output
         else []
     )
     events = state.events
@@ -62,8 +125,8 @@ def render_monitor(
         - 3
         - data_heading_lines
         - len(continuous_lines)
-        - len(feedback_lines)
-        - 2
+        - len(output_lines)
+        - 1
         - 4,
     )
     event_capacity = min(
@@ -120,14 +183,7 @@ def render_monitor(
     lines.extend(event_lines)
     lines.extend(continuous_lines)
     lines.append(paint(f"monitor> {command_buffer}"[:content_width], "96", True))
-    lines.extend(f"  {line}" for line in feedback_lines)
-    lines.append(
-        _style_legend(
-            "white = normal | yellow = recently changed | "
-            "green = running/connected | red = error",
-            content_width,
-        )
-    )
+    lines.extend(f"  {line}" for line in output_lines)
     return "\n".join(lines)
 
 
@@ -173,19 +229,6 @@ def _style_header_status(text: str) -> str:
     else:
         color = "92"
     return paint(text, color, True)
-
-
-def _style_legend(text: str, width: int) -> str:
-    text = text[:width]
-    replacements = (
-        ("white", "97"),
-        ("yellow", "93"),
-        ("green", "92"),
-        ("red", "91"),
-    )
-    for word, color in replacements:
-        text = text.replace(word, paint(word, color, True))
-    return text
 
 
 def _recently_changed(
@@ -380,8 +423,9 @@ def run_monitor(
     read_key: Callable[[float], str],
 ) -> None:
     command_buffer = ""
-    notice = ""
+    command_output = ""
     scroll_offset = 0
+    history = _CommandHistory()
     line_mode = not sys.stdin.isatty()
     previous_frame: str | None = None
     while True:
@@ -395,7 +439,7 @@ def run_monitor(
             worker.unit_id,
             worker.config.interval,
             command_buffer,
-            notice,
+            command_output,
             scroll_offset,
             terminal.columns,
             terminal.lines,
@@ -405,31 +449,49 @@ def run_monitor(
             sys.stdout.write(screen_update)
             sys.stdout.flush()
         previous_frame = frame
-        key = read_key(0.15)
+        try:
+            key = read_key(0.15)
+        except (EOFError, KeyboardInterrupt):
+            return
         if not key:
             continue
         if line_mode:
-            notice, should_quit, scroll_offset = _run_command(
+            history.submit(key.strip())
+            result = _run_command(
                 worker, key.strip(), scroll_offset
             )
-            if should_quit:
+            command_output = _apply_command_output(result, command_output)
+            scroll_offset = result.scroll_offset
+            if result.output_kind == _CommandOutputKind.EXIT:
                 return
             continue
         if key == "\x03":
             return
+        if key in ("UP", "\x1b[A", "\x1bOA"):
+            command_buffer = history.previous(command_buffer)
+            continue
+        if key in ("DOWN", "\x1b[B", "\x1bOB"):
+            command_buffer = history.next(command_buffer)
+            continue
         if len(key) > 1 and ("\n" in key or "\r" in key):
-            notice, should_quit, scroll_offset = _run_command(
+            history.submit(key.strip())
+            result = _run_command(
                 worker, key.strip(), scroll_offset
             )
-            if should_quit:
+            command_output = _apply_command_output(result, command_output)
+            scroll_offset = result.scroll_offset
+            if result.output_kind == _CommandOutputKind.EXIT:
                 return
             continue
         if key in ("\r", "\n"):
-            notice, should_quit, scroll_offset = _run_command(
+            history.submit(command_buffer)
+            result = _run_command(
                 worker, command_buffer, scroll_offset
             )
             command_buffer = ""
-            if should_quit:
+            command_output = _apply_command_output(result, command_output)
+            scroll_offset = result.scroll_offset
+            if result.output_kind == _CommandOutputKind.EXIT:
                 return
         elif key in ("\b", "\x7f"):
             command_buffer = command_buffer[:-1]
@@ -437,56 +499,68 @@ def run_monitor(
             command_buffer += key
 
 
+def _apply_command_output(result: _CommandResult, current_output: str) -> str:
+    if result.output_kind in (_CommandOutputKind.HELP, _CommandOutputKind.ERROR):
+        return result.output
+    if result.output_kind == _CommandOutputKind.CLEAR:
+        return ""
+    return current_output
+
+
 def _run_command(
     worker: MonitorWorker, raw: str, scroll_offset: int
-) -> tuple[str, bool, int]:
+) -> _CommandResult:
     try:
         command = parse_monitor_command(raw)
     except ValueError as error:
-        return f"Error: {error}", False, scroll_offset
+        return _CommandResult(
+            _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+        )
 
     if command.kind == MonitorCommandKind.HELP:
-        return (
+        return _CommandResult(
+            _CommandOutputKind.HELP,
             "Commands: help, pause, resume, clear, status, quit, scroll up, scroll down. "
             "Writes: hr 0=999, c 2=on, c 1-10=on. Continuous: "
             "repeat c 1-10=on [every 0.5s]; pause 1, resume 1, or stop 1. "
             "Input registers and discrete inputs are read-only.",
-            False,
             scroll_offset,
         )
     if command.kind == MonitorCommandKind.PAUSE:
         try:
             worker.pause()
         except RuntimeError as error:
-            return f"Error: {error}", False, scroll_offset
-        return "Polling paused. Writes remain enabled.", False, scroll_offset
+            return _CommandResult(
+                _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+            )
+        return _CommandResult(_CommandOutputKind.SILENT, scroll_offset=scroll_offset)
     if command.kind == MonitorCommandKind.RESUME:
         try:
             worker.resume()
         except RuntimeError as error:
-            return f"Error: {error}", False, scroll_offset
-        return "Polling resumed.", False, scroll_offset
+            return _CommandResult(
+                _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+            )
+        return _CommandResult(_CommandOutputKind.SILENT, scroll_offset=scroll_offset)
     if command.kind == MonitorCommandKind.CLEAR:
-        worker.state.clear_events()
-        return "Change history cleared; current snapshots and configuration are unchanged.", False, scroll_offset
+        return _CommandResult(_CommandOutputKind.CLEAR, scroll_offset=scroll_offset)
     if command.kind == MonitorCommandKind.STATUS:
-        state = worker.state.display()
-        ranges = ", ".join(
-            f"{AREA_ABBREVIATIONS[area]}={item.offset}+{item.count}"
-            for area, item in worker.config.ranges.items()
-        )
-        return (
-            f"Target {worker.host}:{worker.port}, Unit ID {worker.unit_id}; "
-            f"{state.status}, polling every {worker.config.interval:g}s; {ranges}.",
-            False,
-            scroll_offset,
+        return _CommandResult(
+            _CommandOutputKind.SILENT,
+            scroll_offset=scroll_offset,
         )
     if command.kind == MonitorCommandKind.SCROLL_UP:
-        return "Showing earlier offsets.", False, max(0, scroll_offset - 5)
+        return _CommandResult(
+            _CommandOutputKind.SILENT,
+            scroll_offset=max(0, scroll_offset - 5),
+        )
     if command.kind == MonitorCommandKind.SCROLL_DOWN:
-        return "Showing later offsets.", False, scroll_offset + 5
+        return _CommandResult(
+            _CommandOutputKind.SILENT,
+            scroll_offset=scroll_offset + 5,
+        )
     if command.kind == MonitorCommandKind.QUIT:
-        return "Stopping monitor.", True, scroll_offset
+        return _CommandResult(_CommandOutputKind.EXIT, scroll_offset=scroll_offset)
     if command.kind in (
         MonitorCommandKind.PAUSE_CONTINUOUS,
         MonitorCommandKind.RESUME_CONTINUOUS,
@@ -496,19 +570,17 @@ def _run_command(
         try:
             if command.kind == MonitorCommandKind.STOP_CONTINUOUS:
                 worker.stop_continuous_write(command.writer_id)
-                action = "Stop requested for"
             elif command.kind == MonitorCommandKind.PAUSE_CONTINUOUS:
                 worker.pause_continuous_write(command.writer_id)
-                action = "Pause requested for"
             else:
                 worker.resume_continuous_write(command.writer_id)
-                action = "Resume requested for"
         except (RuntimeError, ValueError) as error:
-            return f"Error: {error}", False, scroll_offset
-        return (
-            f"{action} continuous write #{command.writer_id}.",
-            False,
-            scroll_offset,
+            return _CommandResult(
+                _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+            )
+        return _CommandResult(
+            _CommandOutputKind.SILENT,
+            scroll_offset=scroll_offset,
         )
     assert command.area is not None
     assert command.offset is not None
@@ -517,37 +589,21 @@ def _run_command(
     values = [command.value] * (end_offset - command.offset + 1)
     if command.kind == MonitorCommandKind.START_CONTINUOUS:
         try:
-            writer_id = worker.start_continuous_write(
+            worker.start_continuous_write(
                 command.area,
                 command.offset,
                 values,
                 command.interval,
             )
         except (RuntimeError, ValueError) as error:
-            return f"Error: {error}", False, scroll_offset
-        cadence = (
-            "as fast as possible"
-            if command.interval is None
-            else f"every {command.interval:g}s"
-        )
-        return (
-            f"Started continuous write #{writer_id} to "
-            f"{AREA_ABBREVIATIONS[command.area]}[{command.offset}-{end_offset}] "
-            f"{cadence}.",
-            False,
-            scroll_offset,
-        )
+            return _CommandResult(
+                _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+            )
+        return _CommandResult(_CommandOutputKind.SILENT, scroll_offset=scroll_offset)
     try:
         worker.submit_write(command.area, command.offset, values)
     except RuntimeError as error:
-        return f"Error: {error}", False, scroll_offset
-    range_text = (
-        str(command.offset)
-        if command.offset == end_offset
-        else f"{command.offset}-{end_offset}"
-    )
-    return (
-        f"Queued write to {AREA_ABBREVIATIONS[command.area]}[{range_text}].",
-        False,
-        scroll_offset,
-    )
+        return _CommandResult(
+            _CommandOutputKind.ERROR, f"Error: {error}", scroll_offset
+        )
+    return _CommandResult(_CommandOutputKind.SILENT, scroll_offset=scroll_offset)
